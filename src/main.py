@@ -96,15 +96,34 @@ async def run_garbage_collector():
             pending_files = db_repo.get_pending_deletions()
             if pending_files:
                 logger.info(f"Found {len(pending_files)} files marked for deletion.")
+                from src.core.orchestrator import Orchestrator
+                
+                # Instantiate orchestrator to reuse is_hot_file routing rules
+                orchestrator = Orchestrator(
+                    db_repo=db_repo,
+                    crypto_service=None,
+                    ai_service=None,
+                    r2_provider=r2_provider,
+                    o2_provider=o2_provider
+                )
+
                 for file_info in pending_files:
                     file_id = str(file_info["file_id"])
-                    logger.info(f"Processing deletion for file: {file_id}")
+                    mime_type = file_info["mime_type"]
+                    file_size = file_info["file_size"]
+                    logger.info(f"Processing deletion for file: {file_id} (MIME: {mime_type}, Size: {file_size})")
                     
-                    # Delete from R2 and O2 Cloud (O2 sync folder) to be safe and thorough
-                    r2_success = r2_provider.delete(file_id)
-                    o2_success = o2_provider.delete(file_id)
+                    # Determine which provider stored the file using deterministic routing rules
+                    is_hot = orchestrator.is_hot_file(mime_type, file_size)
                     
-                    if r2_success and o2_success:
+                    if is_hot:
+                        logger.info(f"File {file_id} is HOT. Deleting from Cloudflare R2...")
+                        success = r2_provider.delete(file_id)
+                    else:
+                        logger.info(f"File {file_id} is COLD. Deleting from O2 Cloud...")
+                        success = o2_provider.delete(file_id)
+                    
+                    if success:
                         # Perform cascade delete from DB
                         db_success = db_repo.delete_file(file_id)
                         if db_success:
@@ -112,7 +131,7 @@ async def run_garbage_collector():
                         else:
                             logger.error(f"Failed to delete file {file_id} from database.")
                     else:
-                        logger.error(f"Failed to completely remove storage objects for {file_id}. R2: {r2_success}, O2: {o2_success}")
+                        logger.error(f"Failed to completely remove storage object for {file_id} from its provider.")
             else:
                 logger.info("No pending deletions found.")
         except Exception as e:
